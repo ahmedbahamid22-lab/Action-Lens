@@ -10,6 +10,12 @@ import zxingcpp
 from dotenv import load_dotenv
 from PIL import Image, ImageOps
 
+# Composant optionnel : ouvre en priorité la caméra arrière sur mobile.
+try:
+    from streamlit_back_camera_input import back_camera_input
+except ImportError:
+    back_camera_input = None
+
 
 # ==========================================
 # CONFIGURATION
@@ -19,7 +25,7 @@ load_dotenv(Path(__file__).resolve().parent / ".env")
 
 
 def get_api_key():
-    """Clé API locale (.env) ou Streamlit Cloud (Secrets)."""
+    """Clé API dans .env (PC) ou dans les Secrets Streamlit Cloud."""
     key = os.getenv("SERPAPI_API_KEY", "").strip()
     if key:
         return key
@@ -32,82 +38,81 @@ def get_api_key():
 SERPAPI_API_KEY = get_api_key()
 SERPAPI_IMAGE = "https://serpapi.com/image"
 SERPAPI_SEARCH = "https://serpapi.com/search.json"
-SEARCH_QUERY = "action prix"
+SEARCH_QUERY = "action prix"  # Texte interne, non affiché dans l'interface.
 MAX_IMAGE_BYTES = 500_000
 MAX_RESULTS = 10
 
-# Exemple de fiche : /fr-fr/p/2532939/eau-de-toilette-adidas-ice-dive/
+# Mettre True pour afficher les résultats visuels détaillés.
+SHOW_VISUAL_RESULTS = False
+# À activer uniquement pendant les tests techniques.
+SHOW_DIAGNOSTICS = False
+
 ACTION_PATH = re.compile(
     r"^/(?:[a-z]{2}-[a-z]{2}/)?p/(\d+)(?:/|$)", re.IGNORECASE
 )
 
 
 # ==========================================
-# RECHERCHES SERPAPI
+# RECHERCHE ET PREPARATION DE LA PHOTO
 # ==========================================
 
 def request_json(method, url, **kwargs):
-    """Appel HTTP commun aux recherches image et texte."""
+    """Effectuer un appel à l'API et récupérer son résultat."""
     try:
-        response = requests.request(
-            method, url, timeout=(10, 120), **kwargs
-        )
+        response = requests.request(method, url, timeout=(10, 120), **kwargs)
         response.raise_for_status()
         data = response.json()
     except requests.Timeout as exc:
-        raise RuntimeError(
-            "SerpApi met trop de temps à répondre. Réessaie plus tard."
-        ) from exc
+        raise RuntimeError("La recherche prend trop de temps. Réessaie plus tard.") from exc
     except requests.RequestException as exc:
-        raise RuntimeError(
-            f"Connexion à SerpApi impossible : {type(exc).__name__}"
-        ) from exc
+        raise RuntimeError(f"Connexion impossible : {type(exc).__name__}") from exc
     except ValueError as exc:
-        raise RuntimeError("SerpApi a renvoyé une réponse non JSON.") from exc
+        raise RuntimeError("Le service a renvoyé une réponse invalide.") from exc
 
     if not isinstance(data, dict):
-        raise RuntimeError("Format de réponse SerpApi inattendu.")
+        raise RuntimeError("Format de réponse inattendu.")
     if data.get("error"):
-        raise RuntimeError(str(data["error"]))
+        # Ne pas afficher les détails techniques du fournisseur aux utilisateurs.
+        raise RuntimeError(
+            "La recherche n’a pas abouti. Réessaie avec une autre photo "
+            "ou un autre code-barres."
+        )
     return data
 
 
-def prepare_image(uploaded_file):
-    """Réduire la photo pour l'envoi à SerpApi (< 500 Ko)."""
-    img = ImageOps.exif_transpose(
-        Image.open(io.BytesIO(uploaded_file.getvalue()))
+def prepare_image(photo):
+    """Compresser l'image avant son envoi (moins de 500 Ko)."""
+    image = ImageOps.exif_transpose(
+        Image.open(io.BytesIO(photo.getvalue()))
     ).convert("RGB")
 
     for max_dim in (1600, 1280, 1024, 800, 640):
-        reduced = img.copy()
+        reduced = image.copy()
         reduced.thumbnail((max_dim, max_dim), Image.Resampling.LANCZOS)
         for quality in (85, 75, 65, 55, 45):
             output = io.BytesIO()
             reduced.save(output, format="JPEG", quality=quality, optimize=True)
             if output.tell() < MAX_IMAGE_BYTES:
                 return output.getvalue()
-
     raise ValueError("Impossible de compresser cette photo.")
 
 
 def upload_picture(jpeg_bytes):
-    data = request_json(
-        "POST",
-        SERPAPI_IMAGE,
+    response = request_json(
+        "POST", SERPAPI_IMAGE,
         data={"api_key": SERPAPI_API_KEY},
         files={"image": ("produit.jpg", jpeg_bytes, "image/jpeg")},
     )
-    image_id = data.get("image_id")
+    image_id = response.get("image_id")
     if not image_id:
-        raise RuntimeError("SerpApi n'a pas fourni d'identifiant d'image.")
+        raise RuntimeError("L'envoi de la photo a échoué.")
     return image_id
 
 
-def google_lens(image_id):
-    """Recherche par photo orientée automatiquement vers Action."""
+def search_by_photo(image_id):
+    """Recherche visuelle orientée vers les articles Action."""
     return request_json(
-        "GET",
-        SERPAPI_SEARCH,
+        "GET", SERPAPI_SEARCH,
         params={
             "engine": "google_lens",
             "image_id": image_id,
@@ -121,11 +126,10 @@ def google_lens(image_id):
 
 
 @st.cache_data(ttl=4 * 3600, show_spinner=False)
-def google_search_action(query):
-    """Recherche Google textuelle ; résultat mis en cache pendant 4 h."""
+def search_action_by_text(query):
+    """Recherche textuelle utilisée uniquement après lecture d'un EAN."""
     return request_json(
-        "GET",
-        SERPAPI_SEARCH,
+        "GET", SERPAPI_SEARCH,
         params={
             "engine": "google",
             "q": query,
@@ -138,13 +142,12 @@ def google_search_action(query):
 
 
 # ==========================================
-# EXTRACTION DES LIENS OFFICIELS ACTION
+# RESULTATS ACTION
 # ==========================================
 
 def extract_action_products(items, required_product_id=None):
-    """Ne conserver que les véritables URL de produits action.com."""
+    """Extraire les numéros présents dans les liens produits action.com."""
     products = {}
-
     for item in items:
         if not isinstance(item, dict):
             continue
@@ -156,20 +159,14 @@ def extract_action_products(items, required_product_id=None):
             host = (parsed.hostname or "").lower()
         except ValueError:
             continue
-
-        if parsed.scheme != "https" or host not in {
-            "action.com", "www.action.com"
-        }:
+        if parsed.scheme != "https" or host not in ("action.com", "www.action.com"):
             continue
-
         match = ACTION_PATH.match(parsed.path)
         if not match:
             continue
-
         product_id = match.group(1)
         if required_product_id and product_id != required_product_id:
             continue
-
         candidate = {
             "id": product_id,
             "title": item.get("title") or "Article Action",
@@ -181,35 +178,33 @@ def extract_action_products(items, required_product_id=None):
             candidate["fr"] and not products[product_id]["fr"]
         ):
             products[product_id] = candidate
-
     return sorted(products.values(), key=lambda p: not p["fr"])
 
 
-def show_action_products(products, label="Référence Action"):
-    """Mettre la référence Action en évidence, avec sa fiche officielle."""
+def show_action_products(products, label="Numéro d'article Action"):
+    """Afficher les fiches Action avec leur numéro."""
     if not products:
-        st.info("Aucune fiche produit Action confirmée dans les résultats.")
+        st.info("Aucune fiche produit Action trouvée pour cette recherche.")
         return
 
     if len(products) > 1:
         st.warning(
-            "Plusieurs articles possibles : compare la photo, le modèle "
-            "et la contenance avant de choisir."
+            "Plusieurs articles possibles : vérifie la photo, le modèle "
+            "et la contenance avant de choisir un numéro."
         )
 
     for index, product in enumerate(products):
         if index == 0:
             st.subheader(label)
         else:
-            st.markdown("---")
-
+            st.divider()
         st.code(product["id"], language=None)
         st.write(product["title"])
         if product["thumbnail"]:
             try:
                 st.image(product["thumbnail"], width=140)
             except Exception:
-                pass  # Une image distante peut ne plus être disponible.
+                pass
         st.link_button(
             "Voir la fiche sur Action.com",
             product["link"],
@@ -218,14 +213,15 @@ def show_action_products(products, label="Référence Action"):
 
 
 def show_visual_results(results):
-    """Afficher les 10 premiers résultats classiques de Google Lens."""
-    st.subheader("🔎 Résultats Google Lens")
+    """Détails facultatifs, masqués par défaut."""
+    st.subheader("🔎 Autres résultats de la recherche")
     if not results:
-        st.info("Aucun résultat visuel trouvé.")
+        st.info("Aucun autre résultat trouvé.")
         return
-
-    st.write(f"{len(results)} résultat(s) renvoyé(s).")
+    st.write(f"{len(results)} résultat(s) trouvés.")
     for i, item in enumerate(results[:MAX_RESULTS], 1):
+        if not isinstance(item, dict):
+            continue
         st.markdown(f"**{i}. {item.get('title') or 'Produit'}**")
         thumbnail = item.get("thumbnail") or item.get("image")
         if thumbnail:
@@ -241,86 +237,101 @@ def show_visual_results(results):
 
 
 def action_search_link(value):
-    """Recherche de secours sur le site officiel (pas de clé API)."""
+    """Lien de recherche de secours sur le site officiel."""
     return f"https://www.action.com/fr-fr/search/?q={quote(value)}"
 
 
 # ==========================================
-# LECTURE D'UN CODE-BARRES
+# CAMERA ET LECTURE DU CODE-BARRES
 # ==========================================
 
-def scan_barcodes(uploaded_file):
-    """Scanner EAN/UPC et autres codes-barres numériques sur une photo."""
-    image = ImageOps.exif_transpose(
-        Image.open(io.BytesIO(uploaded_file.getvalue()))
-    ).convert("RGB")
+def take_photo(label, key):
+    """Priorité à la caméra arrière ; caméra native si composant absent."""
+    if back_camera_input is not None:
+        st.caption("Utilise la caméra arrière et touche l'image pour capturer.")
+        try:
+            return back_camera_input(height=390, width=360, key=key)
+        except Exception:
+            st.info("Caméra arrière indisponible : utilise la caméra standard.")
 
-    # Limiter la taille pour éviter de ralentir le téléphone/serveur.
+    st.caption("Sur téléphone, sélectionne la caméra arrière si nécessaire.")
+    return st.camera_input(label, key=f"{key}_native")
+
+
+def scan_barcodes(photo):
+    """Lire les codes-barres EAN/UPC à partir d'une photo."""
+    image = ImageOps.exif_transpose(
+        Image.open(io.BytesIO(photo.getvalue()))
+    ).convert("RGB")
     image.thumbnail((2800, 2800), Image.Resampling.LANCZOS)
 
     found = []
     for barcode in zxingcpp.read_barcodes(image):
-        text = (barcode.text or "").strip()
+        value = (barcode.text or "").strip()
         fmt = str(barcode.format)
-        # Exclure QR codes et autres codes 2D : ce mode cible les barres.
         if any(x in fmt.lower() for x in ("qr", "datamatrix", "aztec", "pdf417")):
             continue
-        if text.isdigit() and 8 <= len(text) <= 14:
-            if text not in [b["value"] for b in found]:
-                found.append({"value": text, "format": fmt})
-
+        if value.isdigit() and 8 <= len(value) <= 14:
+            if value not in [item["value"] for item in found]:
+                found.append({"value": value, "format": fmt})
     return found
 
 
 # ==========================================
-# INTERFACE STREAMLIT
+# INTERFACE
 # ==========================================
 
-st.set_page_config(page_title="Action Infos Prix", page_icon="📷")
-st.title("📷 Action Infos Prix")
-st.write("Retrouver rapidement un article sur le site officiel Action.")
+st.set_page_config(page_title="Ahmed Infos Prix", page_icon="📷")
+st.title("📷 Ahmed Infos Prix")
+st.write("Retrouve rapidement un article et sa fiche sur Action.")
 
 mode = st.radio(
     "Choisis une méthode :",
     ["📷 Recherche par photo", "🔢 Numéro Action", "▥ Scanner un code-barres"],
+    index=0,  # Le mode photo s'affiche en premier.
 )
 
-# La clé SerpApi n'est pas nécessaire pour le MODE 2
+# La saisie directe d'un numéro Action fonctionne sans API.
 if not SERPAPI_API_KEY and mode != "🔢 Numéro Action":
-    st.error("Clé SerpApi absente : vérifie .env ou les Secrets Streamlit.")
+    st.error("Service de recherche indisponible. Contacte l'administrateur.")
     st.stop()
 
+
 # ==========================================
-# MODE 1 : PHOTO + GOOGLE LENS
+# MODE 1 : RECHERCHE PAR PHOTO
 # ==========================================
 
 if mode == "📷 Recherche par photo":
-    st.caption(f"Recherche Google Lens : « {SEARCH_QUERY} »")
+    st.caption("Recherche avec l'IA")
 
     method = st.radio(
-        "Source de la photo", ["Importer", "Prendre une photo"],
+        "Source de la photo",
+        ["Prendre une photo", "Importer"],
+        index=0,  # Caméra affichée par défaut.
         horizontal=True,
         key="photo_method",
     )
-    if method == "Importer":
+
+    if method == "Prendre une photo":
+        photo = take_photo("Photographier l'article", "lens_back_cam")
+    else:
         photo = st.file_uploader(
-            "Photo de l'article", type=["jpg", "jpeg", "png", "webp"],
+            "Importer une photo de l'article",
+            type=["jpg", "jpeg", "png", "webp"],
             key="lens_file",
         )
-    else:
-        photo = st.camera_input("Photographier l'article", key="lens_cam")
 
-    if photo:
+    if photo is not None:
         st.image(photo, width=250)
 
     if st.button("🔍 Rechercher l'article", type="primary", use_container_width=True):
-        if not photo:
-            st.warning("Ajoute d'abord une photo.")
+        if photo is None:
+            st.warning("Prends ou importe une photo.")
         else:
             try:
-                with st.spinner("Recherche Google Lens en cours..."):
+                with st.spinner("Recherche intelligente en cours..."):
                     image_id = upload_picture(prepare_image(photo))
-                    response = google_lens(image_id)
+                    response = search_by_photo(image_id)
 
                 visual = response.get("visual_matches") or []
                 exact = response.get("exact_matches") or []
@@ -332,89 +343,71 @@ if mode == "📷 Recherche par photo":
                     show_action_products(products[:5])
                 else:
                     st.info("Aucune référence Action trouvée dans cette recherche.")
-                st.divider()
-                show_visual_results(results)
 
-                with st.expander("🔧 Diagnostic"):
-                    st.json({
-                        "visual_matches": len(visual),
-                        "exact_matches": len(exact),
-                        "action_products": len(products),
-                        "status": (response.get("search_metadata") or {}).get("status"),
-                    })
+                # Activer/désactiver les résultats détaillés ici seulement.
+                if SHOW_VISUAL_RESULTS:
+                    st.divider()
+                    show_visual_results(results)
+
+                if SHOW_DIAGNOSTICS:
+                    with st.expander("🔧 Informations techniques"):
+                        st.json({
+                            "visual_matches": len(visual),
+                            "exact_matches": len(exact),
+                            "action_products": len(products),
+                            "status": (response.get("search_metadata") or {}).get("status"),
+                        })
             except (RuntimeError, OSError, ValueError) as exc:
                 st.error(f"Erreur pendant la recherche : {exc}")
 
 
 # ==========================================
-# MODE 2 : SAISIE DU NUMERO ACTION
+# MODE 2 : NUMERO ACTION (SANS API)
 # ==========================================
 
 elif mode == "🔢 Numéro Action":
-
     st.write("Saisis le numéro de l'article Action.")
-
-    # Saisie du numéro
     article_code = st.text_input(
-        "Numéro Action",
-        placeholder="Ex : 2532939",
-        max_chars=10
+        "Numéro Action", placeholder="Ex : 2532939", max_chars=10
     ).strip()
 
-    # Vérifier que le numéro contient 7 chiffres
     if article_code:
-
-        if re.fullmatch(r"\d{7}", article_code):
-
-            # Construire directement l'URL Action
+        if re.fullmatch(r"[0-9]{7}", article_code):
             url = f"https://www.action.com/fr-fr/p/{article_code}"
-
-            #st.success("Lien de l'article prêt !")
-
-            # Ouvrir directement la fiche officielle
             st.link_button(
-                "🛒 Voir l'article sur Action",
-                url,
-                type="primary",
-                use_container_width=True
+                "🛒 Voir l'article sur Action", url,
+                type="primary", use_container_width=True,
             )
-
         else:
-            st.warning(
-                "Le numéro Action doit contenir 7 chiffres."
-            )
+            st.warning("Le numéro Action doit contenir 7 chiffres.")
 
 
 # ==========================================
-# MODE 3 : CODE-BARRES (EAN / UPC)
+# MODE 3 : SCANNER UN CODE-BARRES
 # ==========================================
 
 else:
-    st.write(
-        "Prends une photo nette du code-barres, avec toutes les barres visibles."
-    )
+    st.write("Photographie le code-barres en montrant toutes les barres.")
     scan_method = st.radio(
         "Source du code-barres", ["Prendre une photo", "Importer"],
-        horizontal=True,
-        key="scan_method",
+        index=0, horizontal=True, key="scan_method",
     )
 
     if scan_method == "Prendre une photo":
-        barcode_photo = st.camera_input(
-            "Photographier le code-barres", key="barcode_cam"
-        )
+        barcode_photo = take_photo("Photographier le code-barres", "barcode_back_cam")
     else:
         barcode_photo = st.file_uploader(
-            "Image du code-barres", type=["jpg", "jpeg", "png", "webp"],
+            "Importer l'image du code-barres",
+            type=["jpg", "jpeg", "png", "webp"],
             key="barcode_file",
         )
 
-    if barcode_photo:
+    if barcode_photo is not None:
         st.image(barcode_photo, width=280)
 
     if st.button("▥ Lire et rechercher", type="primary", use_container_width=True):
-        if not barcode_photo:
-            st.warning("Ajoute une photo du code-barres.")
+        if barcode_photo is None:
+            st.warning("Prends ou importe une photo du code-barres.")
         else:
             try:
                 with st.spinner("Lecture du code-barres..."):
@@ -422,8 +415,8 @@ else:
 
                 if not scanned:
                     st.warning(
-                        "Aucun code-barres numérique lisible. Rapproche-toi, "
-                        "évite les reflets et garde les barres nettes."
+                        "Aucun code-barres lisible. Évite les reflets "
+                        "et rapproche la caméra."
                     )
                 else:
                     ean = scanned[0]["value"]
@@ -434,21 +427,19 @@ else:
                     if len(scanned) > 1:
                         st.caption(
                             "Plusieurs codes détectés ; recherche du premier : "
-                            + ", ".join(x["value"] for x in scanned)
+                            + ", ".join(item["value"] for item in scanned)
                         )
 
                     with st.spinner("Recherche du produit chez Action..."):
-                        response = google_search_action(
-                            f'site:action.com "{ean}"'
-                        )
+                        response = search_action_by_text(f'site:action.com "{ean}"')
                         products = extract_action_products(
                             response.get("organic_results") or []
                         )
 
                     if products:
                         st.warning(
-                            "Correspondance(s) possible(s) : vérifie bien "
-                            "le produit sur chaque fiche."
+                            "Correspondance(s) possible(s) : vérifie "
+                            "le produit avant de choisir un numéro."
                         )
                         show_action_products(
                             products[:5], label="Référence(s) Action possible(s)"
@@ -456,7 +447,7 @@ else:
                     else:
                         st.info(
                             "Code-barres reconnu, mais aucune fiche Action "
-                            "n'a été retrouvée automatiquement pour cet EAN/UPC."
+                            "trouvée automatiquement pour ce code."
                         )
                         st.link_button(
                             "Chercher ce code sur Action",
@@ -464,6 +455,6 @@ else:
                             use_container_width=True,
                         )
             except (RuntimeError, OSError, ValueError) as exc:
-                st.error(f"Erreur de lecture/recherche : {exc}")
+                st.error(f"Erreur de lecture ou de recherche : {exc}")
 
-st.caption("Action Infos Prix — Prototype indépendant d'Action — Ahmed")
+st.caption("Ahmed Infos Prix — Prototype indépendant d'Action")
